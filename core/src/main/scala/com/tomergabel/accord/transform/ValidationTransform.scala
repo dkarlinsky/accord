@@ -49,19 +49,6 @@ private class ValidationTransform[ C <: Context, T : C#WeakTypeTag ]( val contex
     context.resetAllAttrs( transformed )
   }
 
-  def defaultCtor( argsToSuper: List[ Tree ] = Nil ) = {
-    DefDef(
-      mods     = NoMods,
-      name     = nme.CONSTRUCTOR,
-      tparams  = Nil,
-      vparamss = List( List.empty ),
-      tpt      = TypeTree(),
-      rhs      = Block(
-        Apply( Select( Super( This( tpnme.EMPTY ), tpnme.EMPTY ), nme.CONSTRUCTOR ), argsToSuper ) :: Nil,
-        Literal( Constant( () ) ) )
-    )
-  }
-
   implicit class ListOfExprConversions[ E : WeakTypeTag ]( seq: List[ Expr[ E ] ] ) {
     def consolidate: Expr[ Seq[ E ] ] =
       context.Expr[ Seq[ E ] ](
@@ -81,7 +68,7 @@ private class ValidationTransform[ C <: Context, T : C#WeakTypeTag ]( val contex
   if ( prototype.size != 1 )
     abort( prototype.tail.head.pos, "Only single-parameter validators are supported!" )
 
-  private case class Subvalidator( description: Tree, extractor: Tree, validation: Tree, ouvtpe: Type )
+  private case class Subvalidator( description: Tree, ouv: Tree, validation: Tree )
 
   private val validatorType = typeOf[ Validator[_] ]
 
@@ -135,7 +122,6 @@ private class ValidationTransform[ C <: Context, T : C#WeakTypeTag ]( val contex
     def unapply( expr: Tree ): Option[ Subvalidator ] = expr match {
       case t if t.tpe <:< validatorType =>
         val ( ouv, ouvtpe ) = extractObjectUnderValidation( expr )
-        val extractor = Function( prototype, ouv )
         val sv = rewriteContextExpressionAsValidator( expr, ouv )
         val desc = renderDescriptionTree( ouv )
         log( s"""
@@ -143,13 +129,11 @@ private class ValidationTransform[ C <: Context, T : C#WeakTypeTag ]( val contex
               |  ouv=$ouv
               |  ouvraw=${showRaw(ouv)}
               |  ouvtpe=$ouvtpe
-              |  extractor=${show(extractor)}
-              |  extractorraw=${showRaw(extractor)}
               |  sv=${show(sv)}
               |  svraw=${showRaw(sv)}
               |  desc=$desc
               |""".stripMargin, ouv.pos )
-        Some( Subvalidator( desc, extractor, sv, ouvtpe ) )
+        Some( Subvalidator( desc, ouv, sv ) )
 
       case _ => None
     }
@@ -165,66 +149,30 @@ private class ValidationTransform[ C <: Context, T : C#WeakTypeTag ]( val contex
   // Rewrite expressions into a validation chain --
 
   /**
-    * Each subvalidator of type Validator[ U ] is essentially rewritten as Validator[ T ], similar to:
-    *
-    * ```
-    * val rewriteOne( description: String, extractor: T => U, sv: Validator[ U ] ): Validator[ T ] =
-    *   ( value: T ) => {
-    *     sv( extractor( value ) ) match {
-    *       case Success => Success
-    *       case Failure( violations ) => Failure( violations map prefixWith( description ) )
-    *   }
-    * ```
-    *
-    * Due to Scala macro limitations, in practice the Validator[ T ] is implemented as an anonymous class of type
-    * Function1[ T, Result ], which is instantiated and returned as the expression value.
+    * Each subvalidator of type Validator[ U ] is essentially rewritten as Validator[ T ] via the
+    * its extractor; constraint violations are prefixed with the extracted description.
     *
     * @param sv The subvalidator to rewrite
     * @return A valid expression representing a [[com.tomergabel.accord.Validator]] of `T`.
     */
-  private def rewriteOne( sv: Subvalidator ): Expr[ Validator[ T ] ] = {
-
-    // Export the description as an expression to be spliced in later
-    val descExpr = context.Expr[ String ]( sv.description )
-
-    // Define the apply() function body (recall that we're in practice implementing Function1[ T, Result ])
-    val applydef = {
-      val Function( _, extractorImpl ) = sv.extractor   // TODO extractor as a function probably unnecessary. Clean up
-      val svdef = ValDef( NoMods, newTermName( "sv" ), TypeTree(), sv.validation )
-      val applysel = Apply( Ident( svdef.name ), extractorImpl :: Nil )
-
-      val successCase = CaseDef( Ident( newTermName( "Success" ) ), EmptyTree, Ident( newTermName( "Success" ) ) )
-      val failCase = {
-        val vterm = newTermName( "violations" )
-        val vexpr = context.Expr[ Seq[ Violation ] ]( Ident( vterm ) )
-        val vappl =
-          reify { Failure( vexpr.splice map { f => f.copy( constraint = descExpr.splice + " " + f.constraint ) } ) }
-        CaseDef(
-          Bind( newTermName( "f" ), Apply( Ident( newTermName( "Failure" ) ), List( Bind( vterm, Ident( nme.WILDCARD ) ) ) ) ),
-          EmptyTree,
-          vappl.tree
-        )
-      }
-
-      val applyimpl = Block(
-        svdef :: Nil,
-        Match( applysel, successCase :: failCase :: Nil )
-      )
-
-      DefDef( NoMods, newTermName( "apply" ), Nil, List( prototype ), TypeTree(), applyimpl )
-    }
-
-    // Declare the anonymous class and wrapper block
-    val anon = newTypeName( context.fresh() )
-    val vtype = TypeTree( appliedType( validatorType.typeConstructor, weakTypeOf[ T ] :: Nil ) )
-    val cdef = ClassDef( NoMods, anon, Nil, Template( vtype :: Nil, emptyValDef, defaultCtor() :: applydef :: Nil ) )
-    val ctor = Apply( Select( New( Ident( anon ) ), nme.CONSTRUCTOR ), List.empty )
-    val rewrite = context.Expr[ Validator[ T ] ]( Block( cdef :: Nil, ctor ) )
+  private def rewriteOne( sv: Subvalidator ) = {
+    val rewrite =
+      q"""
+          new Validator[ ${weakTypeOf[ T ] } ] {
+            def apply( ..$prototype ) = {
+              val sv = ${sv.validation}
+              sv( ${sv.ouv} ) match {
+                case Success => Success
+                case f @ Failure( violations ) =>
+                  Failure( violations map { f => f.copy( constraint = ${sv.description} + " " + f.constraint ) } )
+              }
+            }
+          }
+       """
 
     // Report and return the rewritten validator
     log( s"""|Subvalidator:
              |  Description: ${sv.description}
-             |  Extractor  : ${sv.extractor}
              |  Validation : ${sv.validation}
              |
              |Rewritten as:
@@ -241,8 +189,7 @@ private class ValidationTransform[ C <: Context, T : C#WeakTypeTag ]( val contex
   def transformed: Expr[ Validator[ T ] ] = {
     // Rewrite all validators
     val subvalidators = findSubvalidators( vimpl ) map rewriteOne
-    val svseq: Expr[ Seq[ Validator[ T ] ] ] = subvalidators.consolidate
-    val result: Expr[ Validator[ T ] ] = reify { new combinators.And( svseq.splice :_* ) }
+    val result = context.Expr[ Validator[ T ] ]( q"new combinators.And( ..$subvalidators )" )
 
     log( s"""|Result of validation transform:
              |  Clean: ${show( result )}
