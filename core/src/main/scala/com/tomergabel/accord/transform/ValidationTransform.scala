@@ -49,14 +49,6 @@ private class ValidationTransform[ C <: Context, T : C#WeakTypeTag ]( val contex
     context.resetAllAttrs( transformed )
   }
 
-  implicit class ListOfExprConversions[ E : WeakTypeTag ]( seq: List[ Expr[ E ] ] ) {
-    def consolidate: Expr[ Seq[ E ] ] =
-      context.Expr[ Seq[ E ] ](
-        Apply( Select( Ident( newTermName( "Seq" ) ), newTermName( "apply" ) ),
-        seq map { _.tree } )
-      )
-  }
-
   private val verboseValidatorRewrite = context.settings.contains( "verboseValidationTransform" )
   def log( s: String, pos: Position = context.enclosingPosition ) =
     if ( verboseValidatorRewrite ) info( pos, s, force = false )
